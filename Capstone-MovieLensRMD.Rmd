@@ -1,0 +1,335 @@
+---
+title: 'Capstone Project: Movie Lens Model'
+author: "Bethany Voss"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    theme: journal
+---
+
+# Introduction
+In today's streaming focused entertainment landscape having a way to recommend new movies to users is an important function for a streaming company. Developing a good recommendation system can greatly enhance the value of a streaming platform. Since streaming platforms do not publicize their data, for this project I used data from the Movie Lens website. Movie Lens is a website that allows users to rate movies that they have watched. 
+
+This project was to develop a recommendation system model to predict how different users within the Movie Lens site would rate movies based off of how they have rated similar movies in the past. The data set used has been provided for us and has a few key conditions to note. For computing and size considerations, the data set is only a portion of the full data on the website.
+```{r}
+##########################################################
+# Create edx and final_holdout_test sets 
+##########################################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+options(timeout = 120)
+
+dl <- "ml-10M100K.zip"
+if(!file.exists(dl))
+  download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings_file <- "ml-10M100K/ratings.dat"
+if(!file.exists(ratings_file))
+  unzip(dl, ratings_file)
+
+movies_file <- "ml-10M100K/movies.dat"
+if(!file.exists(movies_file))
+  unzip(dl, movies_file)
+
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                         stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>%
+  mutate(movieId = as.integer(movieId))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+The provided data also has a portion of the data set aside as a final test for the model.
+```{r}
+# Final hold-out test set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.6 or later
+# set.seed(1) # if using R 3.5 or earlier
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in final hold-out test set are also in edx set
+final_holdout_test <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from final hold-out test set back into edx set
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+The first step in creating this model was splitting the data into two sets: a set to train the model and a set to test the model. The second step was creating a simple model based off of the average of all ratings, and adding in effects to refine the model. The next step was adding regularization to the effects to balance out how outliers and bias effect the model. The final step was to test the model with the final holdout set.
+
+The metric of how well the model works is based on the residual mean squared error, or RMSE. RMSE is a measurement of the average difference between the predicted value and the actual value. The lower the RMSE is, the betting the model's predictions are.
+
+# Analysis
+### Formatting the Data
+The first step in creating this model was splitting the data into a train set and a test set. Setting the seed in the beginning ensured that the data was split the same way each time the model is run. 
+```{r}
+#Partitioning Test and Train
+set.seed(1901, sample.kind = "Rounding")
+
+indexes <- split(1:nrow(edx), edx$userId)
+test_ind_capstone <- sapply(indexes, function(ind) sample(ind, ceiling(length(ind)*.2))) %>%
+  unlist(use.names = TRUE) %>% 
+  sort()
+test_set_capstone <- edx[test_ind_capstone,]
+train_set_capstone <- edx[-test_ind_capstone,]
+```
+Movies that were not in both the test set and the train set were removed allowing each movie to have both a prediction and comparison to test it on. 
+```{r}
+#Removing movies that are not in both test & train set
+test_set_capstone <- test_set_capstone %>% 
+  semi_join(train_set_capstone, by = "movieId")
+train_set_capstone <- train_set_capstone %>% 
+  semi_join(test_set_capstone, by = "movieId")
+```
+In order for the data to be in a usable matrix, 'pivot_wider' and 'as.matrix' were used.
+```{r}
+#pivot wider to get matrix
+y <- select(train_set_capstone, movieId, userId, rating) %>%
+  pivot_wider(names_from = movieId, values_from = rating) 
+rnames <- y$userId
+y <- as.matrix(y[,-1])
+rownames(y) <- rnames
+```
+Creating a function that calculates the RMSE score allows for streamlined analysis. This way the RMSE formula will not have to be coded each time the RMSE is checked. 
+```{r}
+#RMSE Function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+The base of this model was the average of all movie ratings, and is labeled `mu` in the model. If the RMSE was calculated based on a model with just the mean, all differences in score would be assumed to be random variation. It would also assume that all users would have the same ratings. For this model, the mean is just the starting point that will be affected as conditions are added to the model. For this data set/model, the mean is 3.512041. 
+```{r}
+#Calculating Rating Mean
+mu<-mean(y, na.rm = TRUE)
+mu
+```
+### Modeling Movie Effects
+The first addition to the model is movie effects. Some movies are more well liked than others, and it is reflected in their ratings. In the model equation, a condition was added to represent the average ranking for the individual movie being assessed. The movie condition was added to the mean to improve our prediction. If a movie has a low rating, the movie condition is negative and lowers where our mean is at. To find what the movie effect is, labeled `b_i` in the model, it is the average of the rating for the individual movie minus `mu` for each movie. It was then stored in the data frame `fit_movies` in order to have a usable format for testing. It was then compared with the test set, and the RMSE was calculated. At this step, the RMSE was .9441766. This is quite a bit better than the RMSE score from just the mean.
+```{r}
+#Modeling Movie Effects
+b_i <- colMeans(y - mu, na.rm = TRUE)
+fit_movies <- data.frame(movieId = as.integer(colnames(y)), 
+                         mu = mu, b_i = b_i)
+
+left_join(test_set_capstone, fit_movies, by = "movieId") %>% 
+  mutate(pred = mu + b_i) %>% 
+  summarize(rmse = RMSE(rating, pred))
+```
+### Modeling User Effects
+The next addition to the model is user effects. This took into account the different rating styles of each individual user. In order to get the user effect, labeled as `b_u`, the mean of the ratings for the individual users was calculated, and then the movie effect `b_i` is accounted for. Like with the movie effect, it was then stored in the data frame `fit_users` in order to have a usable format for testing. It was then compared with the test set, and the RMSE was calculated. At this step the RMSE was .8671674, which is lower than the RMSE score from only the movie effect.  
+```{r}
+#Modeling User Effects
+b_u <- rowMeans(y, na.rm = TRUE)
+b_u <- rowMeans(sweep(y - mu, 2, b_i), na.rm = TRUE)
+
+fit_users <- data.frame(userId = as.integer(rownames(y)), b_u = b_u)
+
+left_join(test_set_capstone, fit_movies, by = "movieId")%>% 
+  left_join(fit_users, by = "userId")%>%
+  mutate(pred = mu + b_i + b_u)%>%
+  summarize(rmse = RMSE(rating, pred))
+```
+### Modeling Genre Effects
+The next addition to the model was genre effects. People who like or dislike a specific genre will theoretically rate it similarly to others that have similar genre preferences. To get the genre effect, labeled as `b_g`, after taking into account the movie and user effects, the data was grouped by specific genre. In the data, the genre column contains all applicable genres in one column, separated by `|`. The line of code `separate_rows(genres, sep="\\|")` was added to split apart the genre labels. Without this line the assessment would be for the grouping of multiple genres instead of each separately. It was then combined with the movie and user effects, compared to the test set, and the RMSE was calculated. The line `mutate(b_g = replace_na(b_g,0))` was added to replace any holes in the genre pairings with 0 instead of `NA` otherwise an error message would occur. At this step the RMSE was .8671242, which is not greatly lower than the previous model version.
+```{r}
+#Modeling Genre Effects
+b_g <- train_set_capstone %>%
+  left_join(fit_movies, by = "movieId") %>%
+  left_join(fit_users, by = "userId") %>%
+  mutate(resid = rating - mu - b_i - b_u) %>%
+  separate_rows(genres, sep= "\\|")%>%
+  group_by(genres) %>%
+  summarize(b_g = mean(resid, na.rm = TRUE))
+
+left_join(test_set_capstone, fit_movies, by = "movieId") %>%
+  left_join(fit_users, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  mutate(b_g = replace_na(b_g, 0),
+    pred = mu + b_i + b_u + b_g) %>%
+  summarize(rmse = RMSE(rating, pred))
+```
+### Modeling Time Effects
+The next addition to the model is time effects. What specific time a user is posting a rating may have an effect on how the user rated it. Attitudes on different movies within the zeitgeist may change over time. For this model it made the most sense to use year as the unit of time frame. Days or months are usually not enough time for attitudes to shift in a meaningful way. The r-package `lubridate` needed to be downloaded in order to easily group the date data into years instead of a full time stamp. First, the time stamp in the train data was mutated into year intervals. Then after accounting for the other effects, the data was grouped by the year time unit to get the time effect, labeled `b_t`. The test set was also be mutated with lubridate to match the time unit. It was then joined with the other effects, compared with the test set, and the RMSE was calculated. The day time unit RMSE was .8672291. This was actually a worse RMSE score than the previous model with genre, movie, and user, but the next step will be to use regularization to improve all features.
+```{r}
+#Modeling Time stamp Effects
+library(lubridate)
+
+train_set_capstone <- train_set_capstone %>%
+  mutate(time_unit = year(as_datetime(timestamp)))
+
+b_t <- train_set_capstone %>%
+  left_join(fit_movies, by = "movieId") %>%
+  left_join(fit_users, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  mutate(resid = rating - mu - b_i - b_u - b_g) %>%
+  group_by(time_unit) %>%
+  summarize(b_t = mean(resid, na.rm = TRUE))
+
+test_set_capstone <- test_set_capstone %>%
+  mutate(time_unit = year(as_datetime(timestamp)))
+
+left_join(test_set_capstone, fit_movies, by = "movieId") %>%
+  left_join(fit_users, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_t, by = "time_unit") %>%
+  mutate(
+    b_i = replace_na(b_i, 0),
+    b_u = replace_na(b_u, 0),
+    b_g = replace_na(b_g, 0),
+    b_t = replace_na(b_t, 0),
+    pred = mu + b_i + b_u + b_g + b_t
+  ) %>%
+  summarize(rmse = RMSE(rating, pred))
+
+```
+### Regularization
+Bias and overfitting are two common issues when making a model, and addressing them can greatly improve how a model functions. For example, not every movie within the data set had an equal amount of ratings to inform the model. Movies with only a few ratings are biased towards whatever those ratings are, which can make obscure movies look better or worse than what a bigger sample size would rate. An overfit model will not work as well when applied to datasets other than the training data. Regularization is a way to prevent overfitting by adding penalties to estimates that have small sample sizes. 
+
+The first step to add regularization to the model is finding what value of lambda minimizes bias across all of the effects. By adding lambda to the effect equations, elements with low sample sizes will have their estimates reduced while those with high sample sizes will not be greatly affected. As a value, lambda controls how aggressively the reduction is applied. A lambda of 0 would have no regularization effect, and too high a lambda could reduce elements with large sample sizes unnecessarily. By tuning what value lambda is, the regularization can be optimized for the data. To find the best lambda for this model, a sequence from 0 to 10 in intervals of .5 was created. The next step was making a function of the RMSE score for our model where the element of lambda is the variable. This way it was easy to run the sequence of numbers through the function and find what value is the lowest RMSE score. Then it was saved as `best_lambda` to use in the model. The best lambda for this model is 5.
+```{r}
+#Finding Best Lambda for Regularizing Movie Effects & User Effects & Genre Effects
+lambdas <- seq(0, 10, 0.5)
+rmses<-sapply(lambdas, function(l) {
+  b_i_reg <- train_set_capstone %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu) / (n() + l))
+ 
+  b_u_reg <- train_set_capstone %>%
+    left_join(b_i_reg, by = "movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i) / (n() + l))
+  
+  b_g_reg <- train_set_capstone %>%
+    left_join(b_i_reg, by = "movieId") %>%
+    left_join(b_u_reg, by = "userId") %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - mu - b_i - b_u) / (n() + l))
+  
+  b_t_reg <- train_set_capstone %>%
+    mutate(time_unit = year(as_datetime(timestamp))) %>%
+    left_join(b_i_reg, by = "movieId") %>%
+    left_join(b_u_reg, by = "userId") %>%
+    left_join(b_g_reg, by = "genres") %>%
+    group_by(time_unit) %>%
+    summarize(b_t = sum(rating - mu - b_i - b_u - b_g) / (n() + l))
+
+  test_set_capstone %>%
+    mutate(time_unit = year(as_datetime(timestamp))) %>%
+    left_join(b_i_reg, by = "movieId") %>%
+    left_join(b_u_reg, by = "userId") %>%
+    left_join(b_g_reg, by = "genres") %>%
+    left_join(b_t_reg, by = "time_unit") %>%
+    mutate(b_g = replace_na(b_g, 0),
+           b_t = replace_na(b_t, 0),
+           pred = mu + b_i + b_u + b_g + b_t) %>%
+    summarize(rmse = RMSE(rating, pred)) %>%
+    pull(rmse)
+})
+
+best_lambda <- lambdas[which.min(rmses)]
+best_lambda
+min(rmses)
+
+```
+Next, regularized versions of all of the effects were made using `best_lambda`.
+```{r}
+#Regularization using best Lambda
+b_i_reg <- train_set_capstone %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu) / (n() + best_lambda))
+
+b_u_reg <- train_set_capstone %>%
+  left_join(b_i_reg, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu - b_i) / (n() + best_lambda))
+
+b_g_reg <- train_set_capstone %>%
+  left_join(b_i_reg, by = "movieId") %>%
+  left_join(b_u_reg, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu - b_i - b_u) / (n() + best_lambda))
+
+b_t_reg <- train_set_capstone %>%
+  mutate(time_unit = year(as_datetime(timestamp))) %>%
+  left_join(b_i_reg, by = "movieId") %>%
+  left_join(b_u_reg, by = "userId") %>%
+  left_join(b_g_reg, by = "genres") %>%
+  group_by(time_unit) %>%
+  summarize(b_t = sum(rating - mu - b_i - b_u - b_g) / (n() + best_lambda))
+
+```
+Then the regularized model was tested against the test set. In order for it to run smoothly, all NA's within the data were replaced with 0 across all of the effects. The RMSE was .8661032.
+```{r}
+#Testing the Regularization (& Replacing NAs with zeros)
+rmse_reg_all <- test_set_capstone %>%
+  left_join(b_i_reg, by = "movieId") %>%
+  left_join(b_u_reg, by = "userId") %>%
+  left_join(b_g_reg, by = "genres") %>%
+  left_join(b_t_reg, by = "time_unit") %>%
+  mutate(
+    b_i = replace_na(b_i, 0),
+    b_u = replace_na(b_u, 0),
+    b_g = replace_na(b_g, 0),
+    b_t = replace_na(b_t, 0),
+    pred = mu + b_i + b_u + b_g + b_t
+  ) %>%
+  summarize(rmse = RMSE(rating, pred)) %>%
+  pull(rmse)
+
+rmse_reg_all
+```
+
+# Results
+To see how well the model did outside of the training and testing data, the model was compared with the final holdout data that was taken out at the very beginning of the project. The final holdout test set also needed to have the time stamp mutated into the year unit with the lubridate package in order for it to match the model. Like with the final model check, all NA's within the data were replaced with 0 across all the effects. Running this, the RMSE score of the final holdout was .8653542. 
+```{r}
+#Testing it with the final holdout 
+final_holdout_test<- final_holdout_test %>%
+  mutate(time_unit = year(as_datetime(timestamp)))
+
+final_rmse <- final_holdout_test %>%
+  left_join(b_i_reg, by = "movieId") %>%
+  left_join(b_u_reg, by = "userId") %>%
+  left_join(b_g_reg, by = "genres") %>%
+  left_join(b_t_reg, by = "time_unit") %>%
+  mutate(
+    b_i = replace_na(b_i, 0),
+    b_u = replace_na(b_u, 0),
+    b_g = replace_na(b_g, 0),
+    b_t = replace_na(b_t, 0),
+    pred = mu + b_i + b_u + b_g + b_t ) %>%
+  summarize(rmse = RMSE(rating, pred)) %>%
+  pull(rmse)
+
+final_rmse
+```
+# Conclusion
+This simple recommendation system model was able to get a decently low final RMSE score. Specifically, the regularization of the model helped lower the score and account for bias and overfitting. There are other methods that could make the RMSE score even lower. This would include combining this model with more advanced techniques like matrix factorization. It would also be theoretically more precise with any additional variables from the original movielens data, though I did use all variables available in this project. In conclusion, a simpler recommendation system with regularization was still able to have a decent predictive output. 
